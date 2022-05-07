@@ -12,7 +12,7 @@
 #include <linux/sched.h>
 #include <linux/genhd.h>
 #include <linux/blkdev.h>
-
+#include <linux/crc32.h>
 #include "ssr.h"
 
 MODULE_AUTHOR("Grigorie Ruxandra <ruxi.grigorie@gmail.com");
@@ -22,7 +22,7 @@ MODULE_LICENSE("GPL");
 
 struct pretty_bio_list {
     struct list_head list;
-
+    struct work_struct work; 
     struct bio *bio;
 };
 
@@ -38,28 +38,166 @@ static struct pretty_block_dev {
   struct pretty_bio_list bios;
   spinlock_t list_lock;
 
+
 } pretty_dev;
 
 void work_handler(struct work_struct *work)
 {
-  struct pretty_block_dev *dev;
 
-	dev = container_of(work, struct pretty_block_dev, work);
+  //struct pretty_block_dev *dev;
+
+	//dev = container_of(work, struct pretty_block_dev, work);
+ struct pretty_bio_list *bio_struct = container_of(work, struct pretty_bio_list, work);
 
   /* ia din lista un bio */
-  struct list_head *p,*q;
+  /*struct list_head *p,*q;
   struct pretty_bio_list *mc;
 
-  pr_info("handler\n");
+ // //pr_info("handler\n");
 
-  list_for_each_safe(p, q, &dev->head) {
+  /*list_for_each_safe(p, q, &dev->head) {
     mc = list_entry(p, struct pretty_bio_list, list);
-    pr_info("ceva\n");
-    
     list_del(p);
     break;
+  }*/
+  ////pr_info("dupa list foreach\n");
+
+  
+
+  struct bio *mc = bio_struct->bio;
+  int dir = bio_data_dir(mc);
+  // WRITE
+  if (dir == REQ_OP_WRITE) {
+    
+    //pr_info ("Write bio\n");
+    // create data bios
+
+    struct bio *bio_1 = bio_alloc(GFP_KERNEL, 1);             // alloc bio
+    memcpy(bio_1, mc, sizeof(struct bio));
+    bio_1->bi_disk = pretty_dev.phys_bdev_1->bd_disk;             // set gendisk
+    bio_1->bi_iter.bi_sector = mc->bi_iter.bi_sector;  // set sector
+    bio_1->bi_opf = dir;                                    // set operation type
+
+    //pr_info("MESAJ BIO 1\n");
+
+    struct bio *bio_2 = bio_alloc(GFP_KERNEL, 1);             // alloc bio
+    memcpy(bio_2, mc, sizeof(struct bio));             // copy bio information in new bio
+    bio_2->bi_disk = pretty_dev.phys_bdev_2->bd_disk;             // set gendisk
+    bio_2->bi_iter.bi_sector = mc->bi_iter.bi_sector;  // set sector
+    bio_2->bi_opf = dir;                                    // set operation type
+    //pr_info("MESAJ BIO 2\n");
+
+
+    // send data bios
+    submit_bio_wait(bio_1);                                 
+    submit_bio_wait(bio_2);
+
+    //pr_info("MESAJ BIO 3\n");
+    
+    struct bio_vec bvec;
+    struct bvec_iter i;
+
+    // crc bios
+    bio_for_each_segment(bvec, mc, i) {
+
+      // CONFIGURE BIO TO READ EACH DATA SECTOR IN SEGMENT VECTOR
+      struct bio *bio_sector_data = bio_alloc(GFP_NOIO, 1);             // alloc bio to read sector data
+      bio_sector_data->bi_disk = pretty_dev.phys_bdev_1->bd_disk;             // set gendisk
+      bio_sector_data->bi_opf = 0;                                      // set operation type as READ
+
+      sector_t sector = i.bi_sector;  
+      bio_sector_data->bi_iter.bi_sector = sector;                      // set sector
+
+      struct page *page_data = alloc_page(GFP_KERNEL);
+      bio_add_page(bio_sector_data, page_data, KERNEL_SECTOR_SIZE, 0);
+
+       //pr_info("MESAJ BIO 4\n");
+      
+      submit_bio_wait(bio_sector_data);                                     // submit bio
+      
+      char *buffer_data = kmap_atomic(page_data);                                 // map page with read data
+
+      unsigned int checksum = crc32(0, (unsigned char *)buffer_data, KERNEL_SECTOR_SIZE);  // compute check-sum
+
+      kunmap_atomic(buffer_data);                                            // cleanup page
+     
+       //pr_info("MESAJ BIO 5\n");
+
+      ////////////////////////
+      // read check-sum sector
+      long long unsigned crc_address = LOGICAL_DISK_SIZE + sector * sizeof(unsigned int);
+      //long long unsigned crc_sector = crc_address % KERNEL_SECTOR_SIZE;
+
+      long long unsigned  crc_sector = LOGICAL_DISK_SECTORS + i.bi_sector / (KERNEL_SECTOR_SIZE / 4);
+      long long unsigned crc_offset = crc_address - KERNEL_SECTOR_SIZE * crc_sector; 
+
+  
+
+      // CONFIGURE BIO TO READ CRC SECTOR FOR EACH SEGMENT IN VEC
+      struct bio *bio_sector_crc = bio_alloc(GFP_NOIO, 1);             // alloc bio to read sector data
+      ////pr_info("bio addr: %x\n", bio_sector_crc);
+     
+      bio_sector_crc->bi_disk = pretty_dev.phys_bdev_1->bd_disk;             // set gendisk
+      bio_sector_crc->bi_opf = 0;                                      // set operation type as READ
+
+      bio_sector_crc->bi_iter.bi_sector = crc_sector;                  // set sector
+
+      struct page *page_crc = alloc_page(GFP_NOIO);
+      bio_add_page(bio_sector_crc, page_crc, KERNEL_SECTOR_SIZE, 0);
+
+
+       //pr_info("MESAJ BIO 6\n");
+
+      submit_bio_wait(bio_sector_crc);                                 // submit bio
+       
+      char *buffer_crc = kmap_atomic(page_crc);  
+      //pr_info("Offset: %lld\n", crc_offset);
+      memcpy(buffer_crc + crc_offset, &checksum, sizeof(unsigned int));  // write new CRC in CRC page
+      kunmap_atomic(buffer_crc);                                            // cleanup page
+     
+
+      //pr_info("MESAJ BIO 7\n");
+      // CONFIGURE BIO TO MODIFY CRC SECTOR
+      bio_sector_crc->bi_opf = 1;                                      // set operation type as READ
+      
+      
+
+      submit_bio_wait(bio_sector_crc);                                 // submit bio
+
+
+      bio_put(bio_sector_crc);
+      __free_page(page_crc);
+       bio_put(bio_sector_data);
+      __free_page(page_data);
+
+
+      ////////////////////////////
+
+     
+
+      ////pr_info("In iter: bio - dir_sus: %d, dir_jos: %d, sector: %d, offset: %u, size: %u\n", dir,  bio->bi_opf, sector, offset, len);
+       
+    }
+  
+  } else {
+        //pr_info ("Read bio\n");
+   
+
+      /* Do each segment independently. */
+      /*
+      bio_for_each_segment(bvec, bio, i) {
+          sector_t sector = i.bi_sector;
+          
+          unsigned long offset = bvec.bv_offset;
+          size_t len = bvec.bv_len;
+
+          //pr_info("In iter: bio - dir_sus: %d, dir_jos: %d, sector: %d, offset: %u, size: %u\n", dir,  bio->bi_opf, sector, offset, len);
+      }*/
+
   }
-  pr_info("dupa list foreach\n");
+
+
+
 
   /* READ:
     read from both disks
@@ -78,8 +216,7 @@ void work_handler(struct work_struct *work)
   // submit_bio_wait(bio);
 
   // bio_end(bio_original);
-  bio_endio(mc->bio);
-  kfree(mc);
+  bio_endio(mc);
 }
 
 static int pretty_block_open(struct block_device *bdev, fmode_t mode)
@@ -94,19 +231,20 @@ static void pretty_block_release(struct gendisk *gd, fmode_t mode)
 static blk_qc_t pretty_submit_bio(struct bio *bio) {
   struct pretty_bio_list *new_bio;
 
-  new_bio = kvmalloc(sizeof(*new_bio), GFP_ATOMIC);
+  new_bio = kmalloc(sizeof(struct pretty_bio_list), GFP_ATOMIC);
 	if (new_bio == NULL)
 		return -1;
 
   new_bio->bio = bio;
+  INIT_WORK(&new_bio->work, work_handler);
 
   // add bio to bio_list
-	list_add(&new_bio->list, pretty_dev.head.prev);
+	//list_add(&new_bio->list, pretty_dev.head.prev);
 
   // add work to queue
-  queue_work(pretty_dev.queue, &pretty_dev.work);
+  queue_work(pretty_dev.queue, &new_bio->work);
   
-  return 0;
+  return BLK_QC_T_NONE;
 }
 
 static const struct block_device_operations pretty_block_ops = {
@@ -138,7 +276,7 @@ static int create_block_device(struct pretty_block_dev *dev)
   dev->gd->queue = blk_alloc_queue(NUMA_NO_NODE);
   
 	snprintf(dev->gd->disk_name, 4, "ssr");
-  pr_info("%s\n", dev->gd->disk_name);
+  //pr_info("%s\n", dev->gd->disk_name);
 	set_capacity(dev->gd, LOGICAL_DISK_SECTORS);
 
 	add_disk(dev->gd);
@@ -203,7 +341,7 @@ static int __init ssr_init(void)
   pretty_dev.queue = create_singlethread_workqueue("pretty_queue");
 
   INIT_LIST_HEAD(&pretty_dev.head);
-  INIT_WORK(&pretty_dev.work, work_handler);
+  
 
   spin_lock_init(&pretty_dev.list_lock);
 
