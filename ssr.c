@@ -20,28 +20,46 @@ MODULE_AUTHOR("Orzata Miruna Narcisa <mirunaorzata21@gmail.com");
 MODULE_DESCRIPTION("RAID1 Driver");
 MODULE_LICENSE("GPL");
 
+struct pretty_bio_list {
+    struct list_head list;
+
+    struct bio *bio;
+};
+
 static struct pretty_block_dev {
 	struct gendisk *gd;
   struct block_device *phys_bdev_1;
   struct block_device *phys_bdev_2;
 
-  struct work_struct work_1; // ph_dev_1
-  struct work_struct work_2; // ph_dev_2
-  // sau poate lista de work, cine stie?
+  struct work_struct work;
+  struct workqueue_struct *queue;
 
-  struct bio_list bios;
+  struct list_head head;
+  struct pretty_bio_list bios;
   spinlock_t list_lock;
 
 } pretty_dev;
 
-struct pretty_bio_list {
-    struct list_head list;
+void work_handler(struct work_struct *work)
+{
+  struct pretty_block_dev *dev;
 
-    struct bio bio;
-};
+	dev = container_of(work, struct pretty_block_dev, work);
 
-void work_handler(void) {
   /* ia din lista un bio */
+  struct list_head *p,*q;
+  struct pretty_bio_list *mc;
+
+  pr_info("handler\n");
+
+  list_for_each_safe(p, q, &dev->head) {
+    mc = list_entry(p, struct pretty_bio_list, list);
+    pr_info("ceva\n");
+    
+    list_del(p);
+    break;
+  }
+  pr_info("dupa list foreach\n");
 
   /* READ:
     read from both disks
@@ -60,6 +78,8 @@ void work_handler(void) {
   // submit_bio_wait(bio);
 
   // bio_end(bio_original);
+  bio_endio(mc->bio);
+  kfree(mc);
 }
 
 static int pretty_block_open(struct block_device *bdev, fmode_t mode)
@@ -72,10 +92,20 @@ static void pretty_block_release(struct gendisk *gd, fmode_t mode)
 }
 
 static blk_qc_t pretty_submit_bio(struct bio *bio) {
+  struct pretty_bio_list *new_bio;
+
+  new_bio = kvmalloc(sizeof(*new_bio), GFP_ATOMIC);
+	if (new_bio == NULL)
+		return -1;
+
+  new_bio->bio = bio;
+
   // add bio to bio_list
-  // add work work list?????
-  // create work
+	list_add(&new_bio->list, pretty_dev.head.prev);
+
   // add work to queue
+  queue_work(pretty_dev.queue, &pretty_dev.work);
+  
   return 0;
 }
 
@@ -89,7 +119,7 @@ static const struct block_device_operations pretty_block_ops = {
 
 static int create_block_device(struct pretty_block_dev *dev)
 {
-  int err;
+  int err = 0;
   
 
 	/* initialize the gendisk structure */
@@ -99,20 +129,24 @@ static int create_block_device(struct pretty_block_dev *dev)
 		err = -ENOMEM;
 		goto out;
 	}
+  blk_alloc_queue(NUMA_NO_NODE);
 
 	dev->gd->major = SSR_MAJOR;
 	dev->gd->first_minor = SSR_FIRST_MINOR;
 	dev->gd->fops = &pretty_block_ops;
 	dev->gd->private_data = dev;
+  dev->gd->queue = blk_alloc_queue(NUMA_NO_NODE);
   
-	snprintf(dev->gd->disk_name, strlen(LOGICAL_DISK_NAME), LOGICAL_DISK_NAME);
+	snprintf(dev->gd->disk_name, 4, "ssr");
+  pr_info("%s\n", dev->gd->disk_name);
 	set_capacity(dev->gd, LOGICAL_DISK_SECTORS);
 
 	add_disk(dev->gd);
 
+  return 0;
+
 out:
 	return err;
-
 }
 
 static struct block_device *open_disk(char *name)
@@ -141,7 +175,7 @@ static int __init ssr_init(void)
 {
   int err = 0;
 
-  err = register_blkdev(SSR_MAJOR, LOGICAL_DISK_NAME);
+  err = register_blkdev(SSR_MAJOR, "ssr");
   if (err < 0) {
     printk(KERN_ERR "unable to register mybdev block device\n");
     return -EBUSY;
@@ -165,7 +199,13 @@ static int __init ssr_init(void)
     goto out_close_phys_block_device;
   }
 
-  // init work_struct
+  // init work_queue
+  pretty_dev.queue = create_singlethread_workqueue("pretty_queue");
+
+  INIT_LIST_HEAD(&pretty_dev.head);
+  INIT_WORK(&pretty_dev.work, work_handler);
+
+  spin_lock_init(&pretty_dev.list_lock);
 
   return 0;
 
@@ -180,8 +220,6 @@ static int __init ssr_init(void)
     unregister_blkdev(SSR_MAJOR, LOGICAL_DISK_NAME);
     return err;
   }
-
-
 
 
 static void __exit ssr_exit(void)
