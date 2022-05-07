@@ -41,6 +41,76 @@ static struct pretty_block_dev {
 
 } pretty_dev;
 
+void modify_crc_on_disk(struct gendisk *dev, struct bvec_iter i) {
+  // CONFIGURE BIO TO READ EACH DATA SECTOR IN SEGMENT VECTOR
+    struct bio *bio_sector_data = bio_alloc(GFP_NOIO, 1);             // alloc bio to read sector data
+    bio_sector_data->bi_disk = dev;                                   // set gendisk
+    bio_sector_data->bi_opf = 0;                                      // set operation type as READ
+
+    sector_t sector = i.bi_sector;  
+    bio_sector_data->bi_iter.bi_sector = sector;                      // set sector
+
+    struct page *page_data = alloc_page(GFP_KERNEL);
+    bio_add_page(bio_sector_data, page_data, KERNEL_SECTOR_SIZE, 0);
+
+      //pr_info("MESAJ BIO 4\n");
+    
+    submit_bio_wait(bio_sector_data);                                     // submit bio
+    
+    char *buffer_data = kmap_atomic(page_data);                                 // map page with read data
+
+    unsigned int checksum = crc32(0, (unsigned char *)buffer_data, KERNEL_SECTOR_SIZE);  // compute check-sum
+
+    kunmap_atomic(buffer_data);                                            // cleanup page
+    
+      //pr_info("MESAJ BIO 5\n");
+
+    ////////////////////////
+    // read check-sum sector
+    long long unsigned crc_address = LOGICAL_DISK_SIZE + sector * sizeof(unsigned int);
+    //long long unsigned crc_sector = crc_address % KERNEL_SECTOR_SIZE;
+
+    long long unsigned  crc_sector = LOGICAL_DISK_SECTORS + i.bi_sector / (KERNEL_SECTOR_SIZE / 4);
+    long long unsigned crc_offset = crc_address - KERNEL_SECTOR_SIZE * crc_sector; 
+
+
+
+    // CONFIGURE BIO TO READ CRC SECTOR FOR EACH SEGMENT IN VEC
+    struct bio *bio_sector_crc = bio_alloc(GFP_NOIO, 1);             // alloc bio to read sector data
+    ////pr_info("bio addr: %x\n", bio_sector_crc);
+    
+    bio_sector_crc->bi_disk = dev;                                   // set gendisk
+    bio_sector_crc->bi_opf = 0;                                      // set operation type as READ
+
+    bio_sector_crc->bi_iter.bi_sector = crc_sector;                  // set sector
+
+    struct page *page_crc = alloc_page(GFP_NOIO);
+    bio_add_page(bio_sector_crc, page_crc, KERNEL_SECTOR_SIZE, 0);
+
+
+      //pr_info("MESAJ BIO 6\n");
+
+    submit_bio_wait(bio_sector_crc);                                 // submit bio
+      
+    char *buffer_crc = kmap_atomic(page_crc);  
+    //pr_info("Offset: %lld\n", crc_offset);
+    memcpy(buffer_crc + crc_offset, &checksum, sizeof(unsigned int));  // write new CRC in CRC page
+    kunmap_atomic(buffer_crc);                                            // cleanup page
+    
+
+    //pr_info("MESAJ BIO 7\n");
+    // CONFIGURE BIO TO MODIFY CRC SECTOR
+    bio_sector_crc->bi_opf = 1;                                      // set operation type as READ
+
+    submit_bio_wait(bio_sector_crc);                                 // submit bio
+
+
+    bio_put(bio_sector_crc);
+    __free_page(page_crc);
+      bio_put(bio_sector_data);
+    __free_page(page_data);
+}
+
 void work_handler(struct work_struct *work)
 {
 
@@ -74,6 +144,7 @@ void work_handler(struct work_struct *work)
 
     struct bio *bio_1 = bio_alloc(GFP_KERNEL, 1);             // alloc bio
     memcpy(bio_1, mc, sizeof(struct bio));
+    bio_copy_data(bio_1, mc);
     bio_1->bi_disk = pretty_dev.phys_bdev_1->bd_disk;             // set gendisk
     bio_1->bi_iter.bi_sector = mc->bi_iter.bi_sector;  // set sector
     bio_1->bi_opf = dir;                                    // set operation type
@@ -82,6 +153,7 @@ void work_handler(struct work_struct *work)
 
     struct bio *bio_2 = bio_alloc(GFP_KERNEL, 1);             // alloc bio
     memcpy(bio_2, mc, sizeof(struct bio));             // copy bio information in new bio
+    bio_copy_data(bio_2, mc);
     bio_2->bi_disk = pretty_dev.phys_bdev_2->bd_disk;             // set gendisk
     bio_2->bi_iter.bi_sector = mc->bi_iter.bi_sector;  // set sector
     bio_2->bi_opf = dir;                                    // set operation type
@@ -100,9 +172,23 @@ void work_handler(struct work_struct *work)
     // crc bios
     bio_for_each_segment(bvec, mc, i) {
 
-      // CONFIGURE BIO TO READ EACH DATA SECTOR IN SEGMENT VECTOR
+      modify_crc_on_disk(pretty_dev.phys_bdev_1->bd_disk, i);
+      modify_crc_on_disk(pretty_dev.phys_bdev_2->bd_disk, i);
+
+      ////pr_info("In iter: bio - dir_sus: %d, dir_jos: %d, sector: %d, offset: %u, size: %u\n", dir,  bio->bi_opf, sector, offset, len);
+       
+    }
+  
+  } else {
+    
+    struct bio_vec bvec;
+    struct bvec_iter i;
+
+    // crc bios
+    bio_for_each_segment(bvec, mc, i) {
+      // read data from disk1
       struct bio *bio_sector_data = bio_alloc(GFP_NOIO, 1);             // alloc bio to read sector data
-      bio_sector_data->bi_disk = pretty_dev.phys_bdev_1->bd_disk;             // set gendisk
+      bio_sector_data->bi_disk = pretty_dev.phys_bdev_1->bd_disk;       // set gendisk
       bio_sector_data->bi_opf = 0;                                      // set operation type as READ
 
       sector_t sector = i.bi_sector;  
@@ -110,8 +196,6 @@ void work_handler(struct work_struct *work)
 
       struct page *page_data = alloc_page(GFP_KERNEL);
       bio_add_page(bio_sector_data, page_data, KERNEL_SECTOR_SIZE, 0);
-
-       //pr_info("MESAJ BIO 4\n");
       
       submit_bio_wait(bio_sector_data);                                     // submit bio
       
@@ -119,24 +203,18 @@ void work_handler(struct work_struct *work)
 
       unsigned int checksum = crc32(0, (unsigned char *)buffer_data, KERNEL_SECTOR_SIZE);  // compute check-sum
 
-      kunmap_atomic(buffer_data);                                            // cleanup page
-     
-       //pr_info("MESAJ BIO 5\n");
+      kunmap_atomic(buffer_data);
 
-      ////////////////////////
-      // read check-sum sector
+
+      // read disk1 crc sector
       long long unsigned crc_address = LOGICAL_DISK_SIZE + sector * sizeof(unsigned int);
-      //long long unsigned crc_sector = crc_address % KERNEL_SECTOR_SIZE;
-
-      long long unsigned  crc_sector = LOGICAL_DISK_SECTORS + i.bi_sector / (KERNEL_SECTOR_SIZE / 4);
+      long long unsigned crc_sector = LOGICAL_DISK_SECTORS + i.bi_sector / (KERNEL_SECTOR_SIZE / 4);
       long long unsigned crc_offset = crc_address - KERNEL_SECTOR_SIZE * crc_sector; 
-
-  
 
       // CONFIGURE BIO TO READ CRC SECTOR FOR EACH SEGMENT IN VEC
       struct bio *bio_sector_crc = bio_alloc(GFP_NOIO, 1);             // alloc bio to read sector data
       ////pr_info("bio addr: %x\n", bio_sector_crc);
-     
+      
       bio_sector_crc->bi_disk = pretty_dev.phys_bdev_1->bd_disk;             // set gendisk
       bio_sector_crc->bi_opf = 0;                                      // set operation type as READ
 
@@ -145,58 +223,129 @@ void work_handler(struct work_struct *work)
       struct page *page_crc = alloc_page(GFP_NOIO);
       bio_add_page(bio_sector_crc, page_crc, KERNEL_SECTOR_SIZE, 0);
 
-
-       //pr_info("MESAJ BIO 6\n");
-
       submit_bio_wait(bio_sector_crc);                                 // submit bio
-       
-      char *buffer_crc = kmap_atomic(page_crc);  
-      //pr_info("Offset: %lld\n", crc_offset);
-      memcpy(buffer_crc + crc_offset, &checksum, sizeof(unsigned int));  // write new CRC in CRC page
-      kunmap_atomic(buffer_crc);                                            // cleanup page
-     
+        
+      char *buffer_crc = kmap_atomic(page_crc);
 
-      //pr_info("MESAJ BIO 7\n");
-      // CONFIGURE BIO TO MODIFY CRC SECTOR
-      bio_sector_crc->bi_opf = 1;                                      // set operation type as READ
-      
-      
+      if (memcmp(buffer_crc + crc_offset, &checksum, sizeof(unsigned int)) == 0) {
+        kunmap_atomic(buffer_crc);
 
-      submit_bio_wait(bio_sector_crc);                                 // submit bio
+        char *initial_buffer = kmap_atomic(bvec.bv_page);
+        buffer_data = kmap_atomic(page_data);
+
+        memcpy(initial_buffer + bvec.bv_offset, buffer_data, bvec.bv_len);
+
+        kunmap_atomic(buffer_data);
+        kunmap_atomic(initial_buffer);
+      } else {
+        kunmap_atomic(buffer_crc);
+
+        // read data from disk2
+        struct bio *bio_sector_data = bio_alloc(GFP_NOIO, 1);             // alloc bio to read sector data
+        bio_sector_data->bi_disk = pretty_dev.phys_bdev_2->bd_disk;       // set gendisk
+        bio_sector_data->bi_opf = 0;                                      // set operation type as READ
+
+        sector_t sector = i.bi_sector;  
+        bio_sector_data->bi_iter.bi_sector = sector;                      // set sector
+
+        struct page *page_data = alloc_page(GFP_KERNEL);
+        bio_add_page(bio_sector_data, page_data, KERNEL_SECTOR_SIZE, 0);
+        
+        submit_bio_wait(bio_sector_data);                                     // submit bio
+        
+        char *buffer_data = kmap_atomic(page_data);                                 // map page with read data
+
+        unsigned int checksum = crc32(0, (unsigned char *)buffer_data, KERNEL_SECTOR_SIZE);  // compute check-sum
+
+        kunmap_atomic(buffer_data);
 
 
-      bio_put(bio_sector_crc);
-      __free_page(page_crc);
-       bio_put(bio_sector_data);
-      __free_page(page_data);
+        // read disk2 crc sector
+        long long unsigned crc_address = LOGICAL_DISK_SIZE + sector * sizeof(unsigned int);
+        long long unsigned crc_sector = LOGICAL_DISK_SECTORS + i.bi_sector / (KERNEL_SECTOR_SIZE / 4);
+        long long unsigned crc_offset = crc_address - KERNEL_SECTOR_SIZE * crc_sector; 
 
+        // CONFIGURE BIO TO READ CRC SECTOR FOR EACH SEGMENT IN VEC
+        struct bio *bio_sector_crc = bio_alloc(GFP_NOIO, 1);             // alloc bio to read sector data
+        
+        bio_sector_crc->bi_disk = pretty_dev.phys_bdev_2->bd_disk;             // set gendisk
+        bio_sector_crc->bi_opf = 0;                                      // set operation type as READ
 
-      ////////////////////////////
+        bio_sector_crc->bi_iter.bi_sector = crc_sector;                  // set sector
 
-     
+        struct page *page_crc = alloc_page(GFP_NOIO);
+        bio_add_page(bio_sector_crc, page_crc, KERNEL_SECTOR_SIZE, 0);
 
-      ////pr_info("In iter: bio - dir_sus: %d, dir_jos: %d, sector: %d, offset: %u, size: %u\n", dir,  bio->bi_opf, sector, offset, len);
-       
-    }
-  
-  } else {
-        //pr_info ("Read bio\n");
-   
-
-      /* Do each segment independently. */
-      /*
-      bio_for_each_segment(bvec, bio, i) {
-          sector_t sector = i.bi_sector;
+        submit_bio_wait(bio_sector_crc);                                 // submit bio
           
-          unsigned long offset = bvec.bv_offset;
-          size_t len = bvec.bv_len;
+        char *buffer_crc = kmap_atomic(page_crc);
 
-          //pr_info("In iter: bio - dir_sus: %d, dir_jos: %d, sector: %d, offset: %u, size: %u\n", dir,  bio->bi_opf, sector, offset, len);
-      }*/
+        if (memcmp(buffer_crc + crc_offset, &checksum, sizeof(unsigned int)) == 0) {
+          kunmap_atomic(buffer_crc);
 
+          char *initial_buffer = kmap_atomic(bvec.bv_page);
+          buffer_data = kmap_atomic(page_data);
+
+          memcpy(initial_buffer + bvec.bv_offset, buffer_data, bvec.bv_len);
+
+          kunmap_atomic(buffer_data);
+          kunmap_atomic(initial_buffer);
+
+          // recovery data on the first disk
+          struct bio *bio_sector_data_disk1 = bio_alloc(GFP_NOIO, 1);             // alloc bio to read sector data
+          bio_sector_data_disk1->bi_disk = pretty_dev.phys_bdev_2->bd_disk;       // set gendisk
+          bio_sector_data_disk1->bi_opf = 0;                                      // set operation type as READ
+
+          sector_t sector = i.bi_sector;  
+          bio_sector_data_disk1->bi_iter.bi_sector = sector;                      // set sector
+
+          struct page *page_data_disk1 = alloc_page(GFP_KERNEL);
+          bio_add_page(bio_sector_data_disk1, page_data_disk1, KERNEL_SECTOR_SIZE, 0);
+
+          char *disk1_buffer = kmap_atomic(page_data_disk1);
+          buffer_data = kmap_atomic(page_data);
+
+          memcpy(disk1_buffer + bvec.bv_offset, buffer_data, bvec.bv_len);
+
+          kunmap_atomic(buffer_data);
+          kunmap_atomic(disk1_buffer);
+          
+          submit_bio_wait(bio_sector_data_disk1);
+
+          // recovery crc on the first disk
+
+
+        } else {
+          kunmap_atomic(buffer_crc);
+
+        }
+      }
+    }
+
+
+    // //pr_info ("Read bio\n");
+    // struct bio *bio_1 = bio_alloc(GFP_KERNEL, 1);             // alloc bio
+    // memcpy(bio_1, mc, sizeof(struct bio));
+    // bio_copy_data(bio_1, mc);
+    // bio_1->bi_disk = pretty_dev.phys_bdev_1->bd_disk;             // set gendisk
+    // bio_1->bi_iter.bi_sector = mc->bi_iter.bi_sector;  // set sector
+    // bio_1->bi_opf = dir;                                    // set operation type
+
+    // //pr_info("MESAJ BIO 1\n");
+
+    // struct bio *bio_2 = bio_alloc(GFP_KERNEL, 1);             // alloc bio
+    // memcpy(bio_2, mc, sizeof(struct bio));             // copy bio information in new bio
+    // bio_copy_data(bio_2, mc);
+    // bio_2->bi_disk = pretty_dev.phys_bdev_2->bd_disk;             // set gendisk
+    // bio_2->bi_iter.bi_sector = mc->bi_iter.bi_sector;  // set sector
+    // bio_2->bi_opf = dir;                                    // set operation type
+    // //pr_info("MESAJ BIO 2\n");
+
+
+    // // send data bios
+    // submit_bio_wait(bio_1);                                 
+    // submit_bio_wait(bio_2);
   }
-
-
 
 
   /* READ:
