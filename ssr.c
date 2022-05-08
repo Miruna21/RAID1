@@ -82,8 +82,8 @@ void modify_crc_on_disk(struct gendisk *dev, struct bvec_iter i, struct bio_vec 
         
       char *buffer_crc = kmap_atomic(page_crc);  
 
-     // pr_info("Bvec sector: %lld, current sector in page: %lld, crc_sector: %lld, offset in sector: %lld\n",
-    //    i.bi_sector, current_sector, crc_sector, crc_offset);
+      /*pr_info("Bvec sector: %lld, current sector in page: %lld, crc_sector: %lld, offset in sector: %lld\n",
+        i.bi_sector, current_sector, crc_sector, crc_offset);*/
 
       memcpy(buffer_crc + crc_offset, &checksum, sizeof(unsigned int));  // write new CRC in CRC page
       kunmap_atomic(buffer_crc);                                            // cleanup page
@@ -138,7 +138,8 @@ void work_handler(struct work_struct *work)
     }
   
   } else {
-    
+  
+
     struct bio_vec bvec;
     struct bvec_iter i;
 
@@ -188,6 +189,7 @@ void work_handler(struct work_struct *work)
         // i.bi_sector, current_sector, crc_sector, crc_offset);
 
         char *buffer_crc_disk1 = kmap_atomic(page_crc_disk1); 
+        // DATA IS CORRECT ON DISK1
         if (memcmp(buffer_crc_disk1 + crc_offset, &checksum_disk1, sizeof(unsigned int)) == 0) {
 
           kunmap_atomic(buffer_crc_disk1);
@@ -199,6 +201,73 @@ void work_handler(struct work_struct *work)
 
           kunmap_atomic(buffer_data_disk1);
           kunmap_atomic(initial_buffer);
+
+          // VERIFY DATA IS CORRECT ON DISK2 as well, if not => recover from DISK1
+
+          // read data from disk2 START
+          struct bio *bio_sector_data_disk2 = bio_alloc(GFP_NOIO, 1);                                      // alloc bio to read sector data
+          bio_sector_data_disk2->bi_disk = pretty_dev.phys_bdev_2->bd_disk;                                // set gendisk
+          bio_sector_data_disk2->bi_opf = 0;                                                               // set operation type as READ
+          bio_sector_data_disk2->bi_iter.bi_sector = current_sector;                                       // set sector
+
+          struct page *page_data_disk2 = alloc_page(GFP_KERNEL);
+          bio_add_page(bio_sector_data_disk2, page_data_disk2, KERNEL_SECTOR_SIZE, 0);
+          
+          submit_bio_wait(bio_sector_data_disk2);                                                          // submit bio
+          
+          char *buffer_data_disk2 = kmap_atomic(page_data_disk2);                                          // map page with read data
+          unsigned int checksum_disk2 = crc32(0, (unsigned char *)buffer_data_disk2, KERNEL_SECTOR_SIZE);  // compute check-sum
+          kunmap_atomic(buffer_data_disk2);
+          // read data from disk2 END
+           
+          // INCORRECT DATA ON DISK 2 => copy from DISK1 on DISK2
+          if (memcmp(&checksum_disk1, &checksum_disk2, sizeof(unsigned int)) != 0) {
+  
+            // write sector on disk2
+            struct bio *bio_sector_data_disk2_write = bio_alloc(GFP_NOIO, 1);             // alloc bio to read sector data
+            bio_sector_data_disk2_write->bi_disk = pretty_dev.phys_bdev_2->bd_disk;       // set gendisk
+            bio_sector_data_disk2_write->bi_opf = 1;                                      // set operation type as WRITE
+            bio_sector_data_disk2_write->bi_iter.bi_sector = current_sector;                      // set sector
+
+            struct page *page_data_disk2_write = alloc_page(GFP_KERNEL);
+            bio_add_page(bio_sector_data_disk2_write, page_data_disk2_write, KERNEL_SECTOR_SIZE, 0);
+
+            // copy data from disk1 page sector into disk2 page sector
+            buffer_data_disk1 = kmap_atomic(page_data_disk1);  
+            char* page_data_disk2_buffer_data = kmap_atomic(page_data_disk2_write);  
+
+            memcpy(page_data_disk2_buffer_data, buffer_data_disk1, KERNEL_SECTOR_SIZE);                                                                 
+            kunmap_atomic(buffer_data_disk1); 
+            kunmap_atomic(page_data_disk2_buffer_data); 
+            
+            submit_bio_wait(bio_sector_data_disk2_write); 
+
+            bio_put(bio_sector_data_disk2_write);
+            __free_page(page_data_disk2_write);           
+
+            // write crc sector data into disk2 crc sector                         
+            struct bio *bio_sector_crc_disk2_write = bio_alloc(GFP_NOIO, 1);                 // alloc bio to read sector data
+            bio_sector_crc_disk2_write->bi_disk = pretty_dev.phys_bdev_2->bd_disk;           // set gendisk
+            bio_sector_crc_disk2_write->bi_opf = 1;                                          // set operation type as WRITE
+
+            bio_sector_crc_disk2_write->bi_iter.bi_sector = crc_sector;                      // set sector
+
+            struct page *page_crc_disk2_write = alloc_page(GFP_KERNEL);
+            bio_add_page(bio_sector_crc_disk2_write, page_crc_disk2_write, KERNEL_SECTOR_SIZE, 0);
+
+            // copy data from disk1 crc sector page to disk2 crc sector page
+            buffer_crc_disk1 = kmap_atomic(page_crc_disk1);  
+            char* page_data_disk2_crc_data = kmap_atomic(page_crc_disk2_write);  
+
+            memcpy(page_data_disk2_crc_data, buffer_crc_disk1, KERNEL_SECTOR_SIZE);                                                                 
+            kunmap_atomic(buffer_crc_disk1); 
+            kunmap_atomic( page_data_disk2_crc_data); 
+
+            submit_bio_wait(bio_sector_crc_disk2_write); 
+
+            bio_put(bio_sector_crc_disk2_write);
+            __free_page(page_crc_disk2_write);  
+          }
 
         } else {
 
@@ -316,7 +385,6 @@ void work_handler(struct work_struct *work)
     }
   }
 
-
   /* READ:
     read from both disks
     read CRC from both disks
@@ -356,9 +424,6 @@ static blk_qc_t pretty_submit_bio(struct bio *bio) {
   new_bio->bio = bio;
   INIT_WORK(&new_bio->work, work_handler);
 
-  // add bio to bio_list
-	//list_add(&new_bio->list, pretty_dev.head.prev);
-
   // add work to queue
   queue_work(pretty_dev.queue, &new_bio->work);
   
@@ -376,7 +441,6 @@ static const struct block_device_operations pretty_block_ops = {
 static int create_block_device(struct pretty_block_dev *dev)
 {
   int err = 0;
-  
 
 	/* initialize the gendisk structure */
 	dev->gd = alloc_disk(SSR_NUM_MINORS);
@@ -394,7 +458,6 @@ static int create_block_device(struct pretty_block_dev *dev)
   dev->gd->queue = blk_alloc_queue(NUMA_NO_NODE);
   
 	snprintf(dev->gd->disk_name, 4, "ssr");
-  //pr_info("%s\n", dev->gd->disk_name);
 	set_capacity(dev->gd, LOGICAL_DISK_SECTORS);
 
 	add_disk(dev->gd);
