@@ -41,28 +41,17 @@ static struct pretty_block_dev {
 
 } pretty_dev;
 
-void modify_crc_on_disk(struct gendisk *dev, struct bvec_iter i, struct bio_vec bvec) {
+void modify_crc_on_disk(struct bvec_iter i, struct bio_vec bvec) {
     
-    // Read data in biovec page (one or more sectors)
-    struct bio *bio_sector_data = bio_alloc(GFP_NOIO, 1);             // alloc bio to read sector data
-    bio_sector_data->bi_disk = dev;                                   // set gendisk
-    bio_sector_data->bi_opf = 0;                                      // set operation type as READ
-    sector_t sector = i.bi_sector;  
-    bio_sector_data->bi_iter.bi_sector = sector;                      // set sector
-
-    struct page *page_data = alloc_page(GFP_KERNEL);
-    bio_add_page(bio_sector_data, page_data, bvec.bv_len, 0);
-    
-    submit_bio_wait(bio_sector_data);                                     // submit bio
-    
+   
     /* bvec.bv_len can be > KERNEL_SECTOR_SIZE => in one read, multiple adiacent sectors can be read =>
       => itterate through each sector in a bvec_page and compute crc for each sector */
     int j;
     long long unsigned int number_sectors_in_bvec = bvec.bv_len / KERNEL_SECTOR_SIZE;
 
     for (j = 0; j < number_sectors_in_bvec; j++) {           
-      char *buffer_data = kmap_atomic(page_data);                                                                   
-      unsigned int checksum = crc32(0, (unsigned char *)buffer_data + j * KERNEL_SECTOR_SIZE, KERNEL_SECTOR_SIZE);  
+      char *buffer_data = kmap_atomic(bvec.bv_page);                                                                   
+      unsigned int checksum = crc32(0, (unsigned char *)buffer_data +  bvec.bv_offset +  j * KERNEL_SECTOR_SIZE, KERNEL_SECTOR_SIZE);  
       kunmap_atomic(buffer_data);                                                                                   
 
       long long unsigned int current_sector = i.bi_sector + j;
@@ -71,14 +60,15 @@ void modify_crc_on_disk(struct gendisk *dev, struct bvec_iter i, struct bio_vec 
       long long unsigned int crc_offset = crc_address - KERNEL_SECTOR_SIZE * crc_sector; 
 
       struct bio *bio_sector_crc = bio_alloc(GFP_NOIO, 1);             // alloc bio to read sector 
-      bio_sector_crc->bi_disk = dev;                                   // set gendisk
+      bio_sector_crc->bi_disk = pretty_dev.phys_bdev_1->bd_disk;                                   // set gendisk
       bio_sector_crc->bi_opf = 0;                                      // set operation type as READ
       bio_sector_crc->bi_iter.bi_sector = crc_sector;                  // set sector
 
       struct page *page_crc = alloc_page(GFP_NOIO);
       bio_add_page(bio_sector_crc, page_crc, KERNEL_SECTOR_SIZE, 0);
 
-      submit_bio_wait(bio_sector_crc);                                 // submit bio
+      submit_bio_wait(bio_sector_crc);    
+      bio_put(bio_sector_crc);                             // submit bio
         
       char *buffer_crc = kmap_atomic(page_crc);  
 
@@ -87,17 +77,29 @@ void modify_crc_on_disk(struct gendisk *dev, struct bvec_iter i, struct bio_vec 
 
       memcpy(buffer_crc + crc_offset, &checksum, sizeof(unsigned int));  // write new CRC in CRC page
       kunmap_atomic(buffer_crc);                                            // cleanup page
+
+      bio_sector_crc = bio_alloc(GFP_NOIO, 1);
+
+      bio_sector_crc->bi_disk = pretty_dev.phys_bdev_1->bd_disk;               // set gendisk
+      bio_sector_crc->bi_opf = 1;                                      // set operation type as READ
+      bio_sector_crc->bi_iter.bi_sector = crc_sector;                  // set sector
+      bio_add_page(bio_sector_crc, page_crc, KERNEL_SECTOR_SIZE, 0);
+      submit_bio_wait(bio_sector_crc);                                 // submit bio
+      bio_put(bio_sector_crc);              
       
-      bio_sector_crc->bi_opf = 1;                                      // set operation type as WRITE
+      bio_sector_crc = bio_alloc(GFP_NOIO, 1);
+      bio_sector_crc->bi_disk = pretty_dev.phys_bdev_2->bd_disk;               // set gendisk
+      bio_sector_crc->bi_opf = 1;                                      // set operation type as READ
+      bio_sector_crc->bi_iter.bi_sector = crc_sector;                  // set sector
+      bio_add_page(bio_sector_crc, page_crc, KERNEL_SECTOR_SIZE, 0);
 
       submit_bio_wait(bio_sector_crc);                                 // submit bio
 
       bio_put(bio_sector_crc);
-      __free_page(page_crc);
-    }
 
-      bio_put(bio_sector_data);
-    __free_page(page_data);
+      __free_page(page_crc);
+
+    }
 }
 
 void work_handler(struct work_struct *work)
@@ -111,12 +113,12 @@ void work_handler(struct work_struct *work)
   if (dir == REQ_OP_WRITE) {
     
     // create data bios and resubmit them
-    struct bio *bio_1 = bio_alloc(GFP_KERNEL, 1);             // alloc bio
+    struct bio *bio_1 = bio_alloc(GFP_KERNEL, 1);                 // alloc bio
     memcpy(bio_1, mc, sizeof(struct bio));
     bio_copy_data(bio_1, mc);
     bio_1->bi_disk = pretty_dev.phys_bdev_1->bd_disk;             // set gendisk
-    bio_1->bi_iter.bi_sector = mc->bi_iter.bi_sector;  // set sector
-    bio_1->bi_opf = dir;                                    // set operation type
+    bio_1->bi_iter.bi_sector = mc->bi_iter.bi_sector;             // set sector
+    bio_1->bi_opf = dir;                                        // set operation type
 
     struct bio *bio_2 = bio_alloc(GFP_KERNEL, 1);             // alloc bio
     memcpy(bio_2, mc, sizeof(struct bio));             // copy bio information in new bio
@@ -132,13 +134,16 @@ void work_handler(struct work_struct *work)
     struct bvec_iter i;
 
     // crc bios
-    bio_for_each_segment(bvec, mc, i) {
-      modify_crc_on_disk(pretty_dev.phys_bdev_1->bd_disk, i, bvec);
-      modify_crc_on_disk(pretty_dev.phys_bdev_2->bd_disk, i, bvec);
+    bio_for_each_segment(bvec,mc, i) {
+      modify_crc_on_disk(i, bvec);
     }
+
+    bio_put(bio_1);
+    bio_put(bio_2);
   
   } else {
-  
+    
+
 
     struct bio_vec bvec;
     struct bvec_iter i;
