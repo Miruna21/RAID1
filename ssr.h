@@ -1,7 +1,9 @@
-/*
- * Simple Software Raid - Linux header file
+/* SPDX-License-Identifier: GPL
+ * ssr.h - Simple Software Raid - Linux header file
+ *
+ * Author: Grigorie Ruxandra <ruxi.grigorie@gmail.com>
+ * Author: Orzata Miruna Narcisa <mirunaorzata21@gmail.com>
  */
-
 #ifndef SSR_H_
 #define SSR_H_	1
 
