@@ -446,7 +446,7 @@ static int create_block_device(struct pretty_block_dev *dev)
 	/* initialize the gendisk structure */
 	dev->gd = alloc_disk(SSR_NUM_MINORS);
 	if (!dev->gd) {
-		print_err("alloc_disk: failure\n");
+		pr_err("alloc_disk: failure\n");
 		err = -ENOMEM;
 		goto out;
 	}
@@ -497,7 +497,7 @@ static int __init ssr_init(void)
 
 	err = register_blkdev(SSR_MAJOR, "ssr");
 	if (err < 0) {
-		print_err("unable to register mybdev block device\n");
+		pr_err("unable to register mybdev block device\n");
 		return -EBUSY;
 	}
 
@@ -507,14 +507,14 @@ static int __init ssr_init(void)
 
 	pretty_dev.phys_bdev_1 = open_disk(PHYSICAL_DISK1_NAME);
 	if (pretty_dev.phys_bdev_1 == NULL) {
-		print_err("%s No such device\n", PHYSICAL_DISK1_NAME);
+		pr_err("%s No such device\n", PHYSICAL_DISK1_NAME);
 		err = -EINVAL;
 		goto out_delete_logical_block_device;
 	}
 
 	pretty_dev.phys_bdev_2 = open_disk(PHYSICAL_DISK2_NAME);
 	if (pretty_dev.phys_bdev_2 == NULL) {
-		print_err("%s No such device\n", PHYSICAL_DISK2_NAME);
+		pr_err("%s No such device\n", PHYSICAL_DISK2_NAME);
 		err = -EINVAL;
 		goto out_close_phys_block_device;
 	}
