@@ -102,6 +102,7 @@ void modify_crc_on_disk(struct bvec_iter i, struct bio_vec bvec)
 void work_handler(struct work_struct *work)
 {
 	struct pretty_bio_list *bio_struct = container_of(work, struct pretty_bio_list, work);
+	int err = 0;
 
 	struct bio *mc = bio_struct->bio;
 	int dir = bio_data_dir(mc);
@@ -386,6 +387,7 @@ void work_handler(struct work_struct *work)
 
 					} else {
 						kunmap_atomic(buffer_crc_disk2);
+						err = 1;
 					}
 
 					bio_put(bio_sector_data_disk2);
@@ -403,7 +405,10 @@ void work_handler(struct work_struct *work)
 		}
 	}
 
-	bio_endio(mc);
+	if (err == 1)
+		bio_io_error(mc);
+	else
+		bio_endio(mc);
 }
 
 static int pretty_block_open(struct block_device *bdev, fmode_t mode)
@@ -536,7 +541,7 @@ out_delete_logical_block_device:
 	delete_block_device(&pretty_dev);
 
 out:
-	unregister_blkdev(SSR_MAJOR, LOGICAL_DISK_NAME);
+	unregister_blkdev(SSR_MAJOR, "ssr");
 	return err;
 }
 
@@ -546,7 +551,7 @@ static void __exit ssr_exit(void)
 	close_disk(pretty_dev.phys_bdev_2);
 
 	delete_block_device(&pretty_dev);
-	unregister_blkdev(SSR_MAJOR, LOGICAL_DISK_NAME);
+	unregister_blkdev(SSR_MAJOR, "ssr");
 }
 
 module_init(ssr_init);
